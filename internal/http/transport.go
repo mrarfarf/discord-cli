@@ -25,7 +25,9 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 
 	if resp.Header.Get("Content-Encoding") == "br" {
-		resp.Body = io.NopCloser(brotli.NewReader(resp.Body))
+		// Wrap so closing the body still closes the underlying network
+		// connection; io.NopCloser would leak it and prevent connection reuse.
+		resp.Body = brotliReadCloser{r: brotli.NewReader(resp.Body), c: resp.Body}
 		resp.Header.Del("Content-Encoding")
 		resp.Header.Del("Content-Length")
 		resp.ContentLength = -1
@@ -34,3 +36,13 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 
 	return resp, nil
 }
+
+// brotliReadCloser decompresses with brotli while delegating Close to the
+// original response body so the underlying connection is released.
+type brotliReadCloser struct {
+	r io.Reader
+	c io.Closer
+}
+
+func (b brotliReadCloser) Read(p []byte) (int, error) { return b.r.Read(p) }
+func (b brotliReadCloser) Close() error               { return b.c.Close() }

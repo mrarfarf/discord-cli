@@ -45,7 +45,7 @@ func generateInstanceID() (string, error) {
 // Load reads the configuration file and parses it.
 func Load(path string) (*Config, error) {
 	cfg := &Config{
-		Status: "", // Default: online
+		Status: discord.InvisibleStatus, // Default: invisible (quiet listener)
 	}
 
 	file, err := os.Open(path)
@@ -87,9 +87,14 @@ func Load(path string) (*Config, error) {
 		}
 	}
 
-	// Normalize status
-	if cfg.Status == "default" {
-		cfg.Status = ""
+	// Normalize status.
+	// Unset/empty stays invisible (the safe default for a quiet listener);
+	// users can opt into a normal online presence with status = "default".
+	switch cfg.Status {
+	case "":
+		cfg.Status = discord.InvisibleStatus
+	case "default":
+		cfg.Status = discord.OnlineStatus
 	}
 
 	return cfg, nil
@@ -98,7 +103,7 @@ func Load(path string) (*Config, error) {
 // Save writes the configuration to a file.
 func Save(path string, cfg *Config) error {
 	// Ensure directory exists
-	if err := os.MkdirAll(filepath.Dir(path), os.ModePerm); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("failed to create config directory: %w", err)
 	}
 

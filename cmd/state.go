@@ -3,6 +3,7 @@ package cmd
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -30,17 +31,55 @@ import (
 	"github.com/diamondburned/ningen/v3"
 )
 
+// maxSeenMessages bounds the dedup set so a listener running for days doesn't
+// grow memory without limit. Evicted IDs are the oldest ones, which by then are
+// far outside any realistic redelivery/overlap window.
+const maxSeenMessages = 10000
+
 var (
 	targetChannelID discord.ChannelID
 	filterWords     []string
 	lookbackHours   int
-	seenMessages    = make(map[discord.MessageID]bool)
-	seenMutex       sync.RWMutex
 	quitChan        = make(chan struct{})
 	messageCounter  uint64
 	counterMutex    sync.Mutex
 	historicalDone  = make(chan struct{})
+	historicalOnce  sync.Once
+
+	// Bounded FIFO set of recently seen message IDs.
+	seenMutex    sync.Mutex
+	seenMessages = make(map[discord.MessageID]struct{}, maxSeenMessages)
+	seenRing     = make([]discord.MessageID, maxSeenMessages)
+	seenIdx      int
+	seenCount    int
 )
+
+// alreadySeen reports whether id is in the dedup set without recording it.
+func alreadySeen(id discord.MessageID) bool {
+	seenMutex.Lock()
+	_, ok := seenMessages[id]
+	seenMutex.Unlock()
+	return ok
+}
+
+// markSeen records id and reports whether it was already present, atomically.
+// When the set is full the oldest entry is evicted (FIFO).
+func markSeen(id discord.MessageID) (already bool) {
+	seenMutex.Lock()
+	defer seenMutex.Unlock()
+	if _, ok := seenMessages[id]; ok {
+		return true
+	}
+	if seenCount == maxSeenMessages {
+		delete(seenMessages, seenRing[seenIdx])
+	} else {
+		seenCount++
+	}
+	seenRing[seenIdx] = id
+	seenIdx = (seenIdx + 1) % maxSeenMessages
+	seenMessages[id] = struct{}{}
+	return false
+}
 
 // ANSI color codes for terminal output
 var colors = []string{
@@ -79,8 +118,15 @@ func runCLI(token string, channelID discord.ChannelID, filters []string, cfg *co
 
 	api.UserAgent = http.BrowserUserAgent
 	gateway.DefaultIdentity = identifyProps
+
+	// Guard: never announce an online presence by accident. An empty status is
+	// rendered as "online" by Discord, so coerce it to invisible here.
+	presenceStatus := cfg.Status
+	if presenceStatus == "" {
+		presenceStatus = discord.InvisibleStatus
+	}
 	gateway.DefaultPresence = &gateway.UpdatePresenceCommand{
-		Status: cfg.Status,
+		Status: presenceStatus,
 	}
 
 	id := gateway.DefaultIdentifier(token)
@@ -108,10 +154,8 @@ func runCLI(token string, channelID discord.ChannelID, filters []string, cfg *co
 			discordState.Close()
 		}
 
-		// Check if it's an authentication error
-		errStr := err.Error()
-		if strings.Contains(errStr, "401") || strings.Contains(errStr, "Unauthorized") ||
-			strings.Contains(errStr, "invalid token") || strings.Contains(errStr, "authentication") {
+		// Check if it's an authentication error (REST 401 or gateway 4004).
+		if isAuthError(err) {
 			slog.Error("Token appears to be invalid or expired", "err", err)
 			fmt.Println("\n⚠ Token is invalid or expired.")
 			fmt.Println("Starting QR code authentication to get a new token...")
@@ -164,6 +208,22 @@ func runCLI(token string, channelID discord.ChannelID, filters []string, cfg *co
 	}
 
 	return nil
+}
+
+// isAuthError reports whether err represents a Discord authentication failure:
+// a REST 401 (httputil.HTTPError) or a gateway "authentication failed" close
+// (ws.CloseEvent with code 4004). This is more reliable than matching on the
+// error string.
+func isAuthError(err error) bool {
+	var httpErr *httputil.HTTPError
+	if errors.As(err, &httpErr) && httpErr.Status == 401 {
+		return true
+	}
+	var closeErr *ws.CloseEvent
+	if errors.As(err, &closeErr) && closeErr.Code == 4004 {
+		return true
+	}
+	return false
 }
 
 func handleKeyboardInput() {
@@ -232,11 +292,14 @@ func onReady(r *gateway.ReadyEvent) {
 		fmt.Println("\nPress 'Q' + Enter to quit (or Ctrl+C)")
 	}
 
-	// Fetch historical messages if requested
+	// Fetch historical messages if requested.
+	// onReady fires again on every gateway resume/reconnect, so guard the
+	// one-shot fetch + channel close to avoid re-fetching and a double-close panic.
 	if lookbackHours > 0 {
-		fetchHistoricalMessages(targetChannelID, filterWords, lookbackHours)
-		// Signal that historical fetch is complete
-		close(historicalDone)
+		historicalOnce.Do(func() {
+			fetchHistoricalMessages(targetChannelID, filterWords, lookbackHours)
+			close(historicalDone)
+		})
 	}
 }
 
@@ -271,40 +334,25 @@ func fetchHistoricalMessages(channelID discord.ChannelID, filters []string, hour
 			break
 		}
 
-		// Filter messages by timestamp and collect valid ones
-		var validMessages []discord.Message
+		// Collect messages newer than the cutoff; stop once we cross it.
+		reachedCutoff := false
 		for _, msg := range messages {
 			if msg.Timestamp.Time().Before(cutoffTime) {
-				// We've gone past our cutoff time, stop fetching
-				// But still include messages from this batch that are after cutoff
-				for _, m := range messages {
-					if !m.Timestamp.Time().Before(cutoffTime) {
-						validMessages = append(validMessages, m)
-					}
-				}
-				allMessages = append(allMessages, validMessages...)
-				goto done
+				reachedCutoff = true
+				continue
 			}
-			validMessages = append(validMessages, msg)
+			allMessages = append(allMessages, msg)
 		}
 
-		allMessages = append(allMessages, validMessages...)
-
-		// Check if we need to fetch more (if we got 100 messages, there might be more)
-		if len(messages) < 100 {
+		// Done if we've crossed the cutoff or exhausted the channel history.
+		if reachedCutoff || len(messages) < 100 {
 			break
 		}
 
-		// Set the before ID to the oldest message we just fetched
+		// Page back from the oldest message in this batch.
 		beforeID = messages[len(messages)-1].ID
-
-		// If the oldest message is before our cutoff, we're done
-		if messages[len(messages)-1].Timestamp.Time().Before(cutoffTime) {
-			break
-		}
 	}
 
-done:
 	// Process messages in chronological order (oldest first)
 	for i := len(allMessages) - 1; i >= 0; i-- {
 		msg := allMessages[i]
@@ -363,13 +411,10 @@ func outputEmbed(color, timestamp, author, prefix string, e discord.Embed) {
 }
 
 func outputMessage(message discord.Message, filters []string) {
-	// Check if we've already seen this message
-	seenMutex.RLock()
-	if seenMessages[message.ID] {
-		seenMutex.RUnlock()
+	// Cheap early-out for already-seen messages (avoids building search content).
+	if alreadySeen(message.ID) {
 		return
 	}
-	seenMutex.RUnlock()
 
 	// Build searchable content for filtering (main content + embeds + referenced/forwarded)
 	searchContent := formatMessageContent(message.Content, message.Embeds)
@@ -397,10 +442,11 @@ func outputMessage(message discord.Message, filters []string) {
 		}
 	}
 
-	// Mark as seen before outputting
-	seenMutex.Lock()
-	seenMessages[message.ID] = true
-	seenMutex.Unlock()
+	// Mark as seen before outputting; if another goroutine beat us to this ID
+	// (e.g. historical fetch overlapping a live event), skip the duplicate.
+	if markSeen(message.ID) {
+		return
+	}
 
 	// Get a color for this message (cycle through colors)
 	counterMutex.Lock()

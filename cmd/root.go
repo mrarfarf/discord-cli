@@ -66,6 +66,8 @@ var (
 				level = slog.LevelWarn
 			case "error":
 				level = slog.LevelError
+			default:
+				return fmt.Errorf("invalid log level %q (valid: debug, info, warn, error)", logLevel)
 			}
 
 			if err := logger.Load(logPath, level); err != nil {
@@ -75,8 +77,8 @@ var (
 			// Load config (optional, only used for status)
 			cfg, err := config.Load(configPath)
 			if err != nil {
-				// Config is optional, use defaults
-				cfg = &config.Config{Status: ""}
+				// Config is optional, use defaults (invisible: quiet listener)
+				cfg = &config.Config{Status: discord.InvisibleStatus}
 			}
 
 			if token == "" {

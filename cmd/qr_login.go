@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -172,6 +173,15 @@ func loginWithQRCLI() (string, error) {
 	}
 	defer conn.Close()
 
+	// gorilla/websocket forbids concurrent writers. The heartbeat goroutine and
+	// the main loop both send frames, so serialize all writes behind this mutex.
+	var writeMu sync.Mutex
+	writeJSON := func(v any) error {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		return conn.WriteJSON(v)
+	}
+
 	readCh := make(chan []byte, 1)
 	readErr := make(chan error, 1)
 	go func() {
@@ -228,13 +238,13 @@ func loginWithQRCLI() (string, error) {
 							case <-ctx.Done():
 								return
 							case <-heartbeatTicker.C:
-								conn.WriteJSON(map[string]any{"op": "heartbeat"})
+								writeJSON(map[string]any{"op": "heartbeat"})
 							}
 						}
 					}()
 				}
 				fmt.Println("Connected. Handshaking...")
-				if err := conn.WriteJSON(map[string]any{
+				if err := writeJSON(map[string]any{
 					"op":                 "init",
 					"encoded_public_key": encodedPublicKey,
 				}); err != nil {
@@ -256,7 +266,7 @@ func loginWithQRCLI() (string, error) {
 					return "", fmt.Errorf("nonce decrypt failed: %w", err)
 				}
 				nonce := base64.RawURLEncoding.EncodeToString(pt)
-				if err := conn.WriteJSON(map[string]any{"op": "nonce_proof", "nonce": nonce}); err != nil {
+				if err := writeJSON(map[string]any{"op": "nonce_proof", "nonce": nonce}); err != nil {
 					return "", fmt.Errorf("nonce send failed: %w", err)
 				}
 			case "pending_remote_init":
