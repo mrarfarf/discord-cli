@@ -53,6 +53,16 @@ Config path:
 - Darwin: `$HOME/Library/Application Support/discord-cli/config.toml`
 - Windows: `%AppData%/discord-cli/config.toml`
 
+### Presence
+
+By default the client connects with an **invisible** presence so it does not
+appear online while listening. To use a normal online presence instead, set in
+`config.toml`:
+
+```toml
+status = "default"   # online; other values: "idle", "dnd", "invisible"
+```
+
 ## Keyring token entry
 
 If you need to manually set a token:
@@ -74,3 +84,7 @@ security add-generic-password -s discord-cli -a token -w "YOUR_DISCORD_TOKEN"
 ```sh
 secret-tool store --label="Discord Token" service discord-cli username token
 ```
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for release notes.
